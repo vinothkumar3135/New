@@ -1,0 +1,914 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, Header, UploadFile, File
+from fastapi.responses import Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+import re
+import math
+import uuid
+import bcrypt
+import jwt
+import requests
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from typing import List, Optional, Literal
+from datetime import datetime, timezone, timedelta
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# --- DB ---
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# --- Auth Config ---
+JWT_SECRET = os.environ.get('JWT_SECRET', 'infoez-super-secret-key-change-in-production')
+JWT_ALG = 'HS256'
+JWT_EXP_DAYS = 30
+
+# --- Object Storage ---
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+APP_NAME = "infoez"
+_storage_key = None
+_logger = logging.getLogger("infoez")
+
+def init_storage(force: bool = False):
+    global _storage_key
+    if _storage_key and not force:
+        return _storage_key
+    if not EMERGENT_KEY:
+        raise RuntimeError("EMERGENT_LLM_KEY missing")
+    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
+    resp.raise_for_status()
+    _storage_key = resp.json()["storage_key"]
+    return _storage_key
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    key = init_storage()
+    try:
+        resp = requests.put(f"{STORAGE_URL}/objects/{path}",
+            headers={"X-Storage-Key": key, "Content-Type": content_type},
+            data=data, timeout=120)
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (403, 404):
+            key = init_storage(force=True)
+            resp = requests.put(f"{STORAGE_URL}/objects/{path}",
+                headers={"X-Storage-Key": key, "Content-Type": content_type},
+                data=data, timeout=120)
+            resp.raise_for_status()
+        else:
+            raise
+    return resp.json()
+
+def get_object(path: str):
+    key = init_storage()
+    resp = requests.get(f"{STORAGE_URL}/objects/{path}",
+        headers={"X-Storage-Key": key}, timeout=60)
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+
+# --- App ---
+app = FastAPI(title="Infoez API", version="1.0.0")
+api = APIRouter(prefix="/api")
+security = HTTPBearer(auto_error=False)
+
+# --- Utils ---
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def new_id() -> str:
+    return str(uuid.uuid4())
+
+def slugify(text: str) -> str:
+    s = re.sub(r'[^a-zA-Z0-9\s-]', '', text.lower()).strip()
+    s = re.sub(r'[\s_-]+', '-', s)
+    return s[:80]
+
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode('utf-8'), hashed.encode('utf-8'))
+    except Exception:
+        return False
+
+def create_token(user_id: str) -> str:
+    payload = {
+        'sub': user_id,
+        'iat': datetime.now(timezone.utc),
+        'exp': datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def decode_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        return payload.get('sub')
+    except Exception:
+        return None
+
+def strip_user(u: dict) -> dict:
+    return {
+        'id': u['id'], 'name': u['name'], 'email': u['email'],
+        'role': u['role'], 'phone': u.get('phone'),
+        'avatar': u.get('avatar'), 'created_at': u.get('created_at'),
+    }
+
+async def get_current_user(cred: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    if not cred:
+        raise HTTPException(401, "Not authenticated")
+    uid = decode_token(cred.credentials)
+    if not uid:
+        raise HTTPException(401, "Invalid token")
+    user = await db.users.find_one({'id': uid}, {'_id': 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
+
+async def get_current_user_optional(cred: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[dict]:
+    if not cred:
+        return None
+    uid = decode_token(cred.credentials)
+    if not uid:
+        return None
+    return await db.users.find_one({'id': uid}, {'_id': 0})
+
+def require_role(*roles):
+    async def dep(user: dict = Depends(get_current_user)) -> dict:
+        if user['role'] not in roles:
+            raise HTTPException(403, f"Requires role: {roles}")
+        return user
+    return dep
+
+# --- Schemas ---
+class RegisterIn(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: Literal['customer', 'business_owner'] = 'customer'
+    phone: Optional[str] = None
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+
+class CategoryIn(BaseModel):
+    name: str
+    icon: Optional[str] = "Store"
+    color: Optional[str] = "#D97706"
+
+class BusinessIn(BaseModel):
+    name: str
+    description: str
+    category_id: str
+    address: str
+    city: str
+    phone: str
+    email: Optional[str] = None
+    website: Optional[str] = None
+    services: List[str] = []
+    images: List[str] = []
+    price_range: Optional[str] = "$$"
+    hours: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class BusinessUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    category_id: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    website: Optional[str] = None
+    services: Optional[List[str]] = None
+    images: Optional[List[str]] = None
+    price_range: Optional[str] = None
+    hours: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class ReviewIn(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str
+
+class EnquiryIn(BaseModel):
+    name: str = Field(min_length=1)
+    email: EmailStr
+    phone: Optional[str] = None
+    message: str = Field(min_length=1)
+
+class ClaimIn(BaseModel):
+    reason: str
+    proof_url: Optional[str] = None
+
+class SubscribeIn(BaseModel):
+    plan_id: str
+
+# --- Auth Routes ---
+@api.get("/")
+async def root():
+    return {"app": "Infoez API", "status": "ok"}
+
+@api.post("/auth/register")
+async def register(data: RegisterIn):
+    existing = await db.users.find_one({'email': data.email.lower()})
+    if existing:
+        raise HTTPException(400, "Email already registered")
+    user = {
+        'id': new_id(),
+        'name': data.name.strip(),
+        'email': data.email.lower(),
+        'password': hash_password(data.password),
+        'role': data.role,
+        'phone': data.phone,
+        'avatar': None,
+        'created_at': now_iso(),
+    }
+    await db.users.insert_one(user)
+    return {'token': create_token(user['id']), 'user': strip_user(user)}
+
+@api.post("/auth/login")
+async def login(data: LoginIn):
+    user = await db.users.find_one({'email': data.email.lower()})
+    if not user or not verify_password(data.password, user['password']):
+        raise HTTPException(401, "Invalid credentials")
+    return {'token': create_token(user['id']), 'user': strip_user(user)}
+
+@api.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return strip_user(user)
+
+@api.patch("/auth/me")
+async def update_me(data: UserUpdate, user: dict = Depends(get_current_user)):
+    upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    if upd:
+        await db.users.update_one({'id': user['id']}, {'$set': upd})
+    fresh = await db.users.find_one({'id': user['id']}, {'_id': 0})
+    return strip_user(fresh)
+
+# --- Categories ---
+@api.get("/categories")
+async def list_categories():
+    cats = await db.categories.find({}, {'_id': 0}).to_list(500)
+    for c in cats:
+        c['business_count'] = await db.businesses.count_documents({'category_id': c['id'], 'status': 'active'})
+    return cats
+
+@api.post("/categories")
+async def create_category(data: CategoryIn, user: dict = Depends(require_role('admin'))):
+    cat = {'id': new_id(), 'name': data.name, 'slug': slugify(data.name),
+           'icon': data.icon, 'color': data.color, 'created_at': now_iso()}
+    await db.categories.insert_one(cat)
+    return {k: v for k, v in cat.items() if k != '_id'}
+
+@api.delete("/categories/{cid}")
+async def delete_category(cid: str, user: dict = Depends(require_role('admin'))):
+    await db.categories.delete_one({'id': cid})
+    return {'ok': True}
+
+# --- Businesses ---
+def business_out(b: dict) -> dict:
+    return {k: v for k, v in b.items() if k != '_id'}
+
+@api.get("/businesses")
+async def list_businesses(
+    q: Optional[str] = None,
+    category_id: Optional[str] = None,
+    city: Optional[str] = None,
+    min_rating: Optional[float] = None,
+    verified: Optional[bool] = None,
+    sort: Optional[str] = None,
+    featured: Optional[bool] = None,
+    near_lat: Optional[float] = None,
+    near_lng: Optional[float] = None,
+    radius_km: Optional[float] = 25,
+    include_pending: Optional[bool] = False,
+    limit: int = 24,
+    skip: int = 0,
+    user: Optional[dict] = Depends(get_current_user_optional),
+):
+    query = {}
+    # visibility: only active by default; admin can request all via include_pending
+    if not (include_pending and user and user['role'] == 'admin'):
+        query['status'] = 'active'
+    if q:
+        eq = re.escape(q)
+        query['$or'] = [
+            {'name': {'$regex': eq, '$options': 'i'}},
+            {'description': {'$regex': eq, '$options': 'i'}},
+            {'services': {'$elemMatch': {'$regex': eq, '$options': 'i'}}},
+        ]
+    if category_id: query['category_id'] = category_id
+    if city: query['city'] = {'$regex': f'^{re.escape(city)}$', '$options': 'i'}
+    if min_rating is not None: query['rating'] = {'$gte': min_rating}
+    if verified is not None: query['verified'] = verified
+    if featured: query['featured'] = True
+
+    sort_spec = [('created_at', -1)]
+    if sort == 'rating': sort_spec = [('rating', -1), ('review_count', -1)]
+    elif sort == 'popular': sort_spec = [('view_count', -1), ('review_count', -1)]
+
+    # If nearby search, fetch a larger set then filter in Python (small dataset)
+    if near_lat is not None and near_lng is not None:
+        cursor = db.businesses.find(query, {'_id': 0}).sort(sort_spec).limit(500)
+        raw = await cursor.to_list(500)
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371.0
+            p1 = math.radians(lat1); p2 = math.radians(lat2)
+            dphi = math.radians(lat2 - lat1); dl = math.radians(lon2 - lon1)
+            a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+            return 2*R*math.asin(math.sqrt(a))
+        with_dist = []
+        for b in raw:
+            if b.get('lat') is None or b.get('lng') is None: continue
+            d = haversine(near_lat, near_lng, b['lat'], b['lng'])
+            if d <= (radius_km or 25):
+                b['distance_km'] = round(d, 2)
+                with_dist.append(b)
+        with_dist.sort(key=lambda x: x['distance_km'])
+        return {'items': with_dist[skip:skip+limit], 'total': len(with_dist)}
+
+    cursor = db.businesses.find(query, {'_id': 0}).sort(sort_spec).skip(skip).limit(limit)
+    items = await cursor.to_list(limit)
+    total = await db.businesses.count_documents(query)
+    return {'items': items, 'total': total}
+
+@api.get("/businesses/{slug}")
+async def get_business(slug: str, user: Optional[dict] = Depends(get_current_user_optional)):
+    b = await db.businesses.find_one({'slug': slug}, {'_id': 0})
+    if not b:
+        b = await db.businesses.find_one({'id': slug}, {'_id': 0})
+    if not b:
+        raise HTTPException(404, "Business not found")
+    # increment view
+    await db.businesses.update_one({'id': b['id']}, {'$inc': {'view_count': 1}})
+    # check if favorited
+    is_fav = False
+    if user:
+        fav = await db.favorites.find_one({'user_id': user['id'], 'business_id': b['id']})
+        is_fav = bool(fav)
+    b['is_favorited'] = is_fav
+    # category name
+    if b.get('category_id'):
+        cat = await db.categories.find_one({'id': b['category_id']}, {'_id': 0})
+        b['category'] = cat
+    return b
+
+@api.post("/businesses")
+async def create_business(data: BusinessIn, user: dict = Depends(require_role('business_owner', 'admin'))):
+    slug_base = slugify(data.name)
+    slug = slug_base
+    i = 1
+    while await db.businesses.find_one({'slug': slug}):
+        i += 1
+        slug = f"{slug_base}-{i}"
+    # Admin-created listings are auto-approved; owners land in pending queue.
+    status = 'active' if user['role'] == 'admin' else 'pending'
+    biz = {
+        'id': new_id(),
+        'owner_id': user['id'],
+        'slug': slug,
+        **data.model_dump(),
+        'rating': 0.0,
+        'review_count': 0,
+        'view_count': 0,
+        'verified': user['role'] == 'admin',
+        'featured': False,
+        'status': status,
+        'created_at': now_iso(),
+    }
+    await db.businesses.insert_one(biz)
+    # Notify all admins on new pending listing
+    if status == 'pending':
+        admins = await db.users.find({'role': 'admin'}, {'_id': 0, 'id': 1}).to_list(100)
+        for a in admins:
+            await db.notifications.insert_one({
+                'id': new_id(), 'user_id': a['id'],
+                'title': 'New listing pending review',
+                'body': f"'{biz['name']}' by {user['name']} is awaiting approval.",
+                'type': 'pending_listing', 'read': False, 'created_at': now_iso(),
+            })
+    return business_out(biz)
+
+@api.put("/businesses/{bid}")
+async def update_business(bid: str, data: BusinessUpdate, user: dict = Depends(get_current_user)):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    if biz['owner_id'] != user['id'] and user['role'] != 'admin':
+        raise HTTPException(403, "Not your business")
+    upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    if upd:
+        await db.businesses.update_one({'id': bid}, {'$set': upd})
+    fresh = await db.businesses.find_one({'id': bid}, {'_id': 0})
+    return fresh
+
+@api.delete("/businesses/{bid}")
+async def delete_business(bid: str, user: dict = Depends(require_role('admin'))):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    await db.businesses.delete_one({'id': bid})
+    await db.reviews.delete_many({'business_id': bid})
+    await db.favorites.delete_many({'business_id': bid})
+    await db.enquiries.delete_many({'business_id': bid})
+    return {'ok': True}
+
+@api.post("/businesses/{bid}/verify")
+async def verify_business(bid: str, user: dict = Depends(require_role('admin'))):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    await db.businesses.update_one({'id': bid}, {'$set': {'verified': True}})
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': biz['owner_id'],
+        'title': 'Business Verified', 'body': f"Your business '{biz['name']}' was verified by admin.",
+        'type': 'verified', 'read': False, 'created_at': now_iso(),
+    })
+    return await db.businesses.find_one({'id': bid}, {'_id': 0})
+
+@api.post("/businesses/{bid}/approve")
+async def approve_business(bid: str, user: dict = Depends(require_role('admin'))):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    await db.businesses.update_one({'id': bid}, {'$set': {'status': 'active'}})
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': biz['owner_id'],
+        'title': 'Listing Approved',
+        'body': f"Your listing '{biz['name']}' is now live on Infoez.",
+        'type': 'approved', 'read': False, 'created_at': now_iso(),
+    })
+    return await db.businesses.find_one({'id': bid}, {'_id': 0})
+
+@api.post("/businesses/{bid}/reject")
+async def reject_business(bid: str, reason: str = Query("Does not meet our guidelines"), user: dict = Depends(require_role('admin'))):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    await db.businesses.update_one({'id': bid}, {'$set': {'status': 'rejected'}})
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': biz['owner_id'],
+        'title': 'Listing Rejected',
+        'body': f"Your listing '{biz['name']}' was rejected. Reason: {reason}",
+        'type': 'rejected', 'read': False, 'created_at': now_iso(),
+    })
+    return await db.businesses.find_one({'id': bid}, {'_id': 0})
+
+@api.get("/admin/pending-businesses")
+async def pending_businesses(user: dict = Depends(require_role('admin'))):
+    items = await db.businesses.find({'status': 'pending'}, {'_id': 0}).sort('created_at', -1).to_list(500)
+    for b in items:
+        owner = await db.users.find_one({'id': b['owner_id']}, {'_id': 0, 'password': 0})
+        b['owner'] = {'name': owner['name'], 'email': owner['email']} if owner else None
+    return items
+
+@api.post("/businesses/{bid}/feature")
+async def feature_business(bid: str, user: dict = Depends(require_role('admin'))):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    new_val = not biz.get('featured', False)
+    await db.businesses.update_one({'id': bid}, {'$set': {'featured': new_val}})
+    return await db.businesses.find_one({'id': bid}, {'_id': 0})
+
+@api.get("/businesses/owner/me")
+async def my_businesses(user: dict = Depends(require_role('business_owner', 'admin'))):
+    items = await db.businesses.find({'owner_id': user['id']}, {'_id': 0}).to_list(200)
+    return items
+
+# --- Reviews ---
+@api.get("/businesses/{bid}/reviews")
+async def list_reviews(bid: str):
+    reviews = await db.reviews.find({'business_id': bid}, {'_id': 0}).sort('created_at', -1).to_list(500)
+    for r in reviews:
+        u = await db.users.find_one({'id': r['user_id']}, {'_id': 0})
+        r['user'] = {'name': u['name'], 'avatar': u.get('avatar')} if u else None
+    return reviews
+
+@api.post("/businesses/{bid}/reviews")
+async def add_review(bid: str, data: ReviewIn, user: dict = Depends(get_current_user)):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    # one review per user per business (upsert)
+    review = {
+        'id': new_id(), 'business_id': bid, 'user_id': user['id'],
+        'rating': data.rating, 'comment': data.comment, 'created_at': now_iso(),
+    }
+    await db.reviews.delete_many({'business_id': bid, 'user_id': user['id']})
+    await db.reviews.insert_one(review)
+    # recalc rating
+    all_r = await db.reviews.find({'business_id': bid}).to_list(2000)
+    avg = sum(r['rating'] for r in all_r) / len(all_r)
+    await db.businesses.update_one({'id': bid}, {'$set': {'rating': round(avg, 1), 'review_count': len(all_r)}})
+    # notify owner
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': biz['owner_id'],
+        'title': 'New Review', 'body': f"{user['name']} left a {data.rating}-star review on '{biz['name']}'",
+        'type': 'review', 'read': False, 'created_at': now_iso(),
+    })
+    return {k: v for k, v in review.items() if k != '_id'}
+
+@api.get("/reviews/me")
+async def my_reviews(user: dict = Depends(get_current_user)):
+    reviews = await db.reviews.find({'user_id': user['id']}, {'_id': 0}).sort('created_at', -1).to_list(500)
+    for r in reviews:
+        b = await db.businesses.find_one({'id': r['business_id']}, {'_id': 0})
+        r['business'] = {'name': b['name'], 'slug': b['slug'], 'images': b.get('images', [])} if b else None
+    return reviews
+
+@api.delete("/reviews/{rid}")
+async def delete_review(rid: str, user: dict = Depends(get_current_user)):
+    r = await db.reviews.find_one({'id': rid})
+    if not r:
+        raise HTTPException(404, "Not found")
+    if r['user_id'] != user['id'] and user['role'] != 'admin':
+        raise HTTPException(403, "Forbidden")
+    bid = r['business_id']
+    await db.reviews.delete_one({'id': rid})
+    all_r = await db.reviews.find({'business_id': bid}).to_list(2000)
+    avg = (sum(x['rating'] for x in all_r) / len(all_r)) if all_r else 0.0
+    await db.businesses.update_one({'id': bid}, {'$set': {'rating': round(avg, 1), 'review_count': len(all_r)}})
+    return {'ok': True}
+
+# --- Favorites ---
+@api.get("/favorites/me")
+async def my_favorites(user: dict = Depends(get_current_user)):
+    favs = await db.favorites.find({'user_id': user['id']}, {'_id': 0}).to_list(500)
+    ids = [f['business_id'] for f in favs]
+    businesses = await db.businesses.find({'id': {'$in': ids}}, {'_id': 0}).to_list(500)
+    return businesses
+
+@api.post("/favorites/{bid}")
+async def add_fav(bid: str, user: dict = Depends(get_current_user)):
+    existing = await db.favorites.find_one({'user_id': user['id'], 'business_id': bid})
+    if existing:
+        return {'ok': True, 'favorited': True}
+    await db.favorites.insert_one({'id': new_id(), 'user_id': user['id'], 'business_id': bid, 'created_at': now_iso()})
+    return {'ok': True, 'favorited': True}
+
+@api.delete("/favorites/{bid}")
+async def remove_fav(bid: str, user: dict = Depends(get_current_user)):
+    await db.favorites.delete_one({'user_id': user['id'], 'business_id': bid})
+    return {'ok': True, 'favorited': False}
+
+# --- Enquiries ---
+@api.post("/businesses/{bid}/enquiries")
+async def create_enquiry(bid: str, data: EnquiryIn, user: Optional[dict] = Depends(get_current_user_optional)):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    e = {
+        'id': new_id(), 'business_id': bid, 'business_name': biz['name'],
+        'user_id': user['id'] if user else None,
+        **data.model_dump(), 'status': 'new', 'created_at': now_iso(),
+    }
+    await db.enquiries.insert_one(e)
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': biz['owner_id'],
+        'title': 'New Lead / Enquiry', 'body': f"{data.name} sent an enquiry for '{biz['name']}'",
+        'type': 'enquiry', 'read': False, 'created_at': now_iso(),
+    })
+    return {k: v for k, v in e.items() if k != '_id'}
+
+@api.get("/enquiries/me")
+async def my_enquiries(user: dict = Depends(get_current_user)):
+    items = await db.enquiries.find({'user_id': user['id']}, {'_id': 0}).sort('created_at', -1).to_list(500)
+    return items
+
+@api.get("/enquiries/business")
+async def business_enquiries(user: dict = Depends(require_role('business_owner', 'admin'))):
+    biz_list = await db.businesses.find({'owner_id': user['id']}).to_list(200)
+    ids = [b['id'] for b in biz_list]
+    items = await db.enquiries.find({'business_id': {'$in': ids}}, {'_id': 0}).sort('created_at', -1).to_list(1000)
+    return items
+
+# --- Notifications ---
+@api.get("/notifications/me")
+async def my_notifications(user: dict = Depends(get_current_user)):
+    items = await db.notifications.find({'user_id': user['id']}, {'_id': 0}).sort('created_at', -1).to_list(200)
+    return items
+
+@api.patch("/notifications/{nid}/read")
+async def mark_read(nid: str, user: dict = Depends(get_current_user)):
+    await db.notifications.update_one({'id': nid, 'user_id': user['id']}, {'$set': {'read': True}})
+    return {'ok': True}
+
+@api.post("/notifications/read-all")
+async def mark_all_read(user: dict = Depends(get_current_user)):
+    await db.notifications.update_many({'user_id': user['id']}, {'$set': {'read': True}})
+    return {'ok': True}
+
+# --- Subscriptions ---
+PLANS = [
+    {'id': 'free', 'name': 'Free', 'price': 0, 'features': ['Basic listing', 'Up to 5 photos', 'Customer reviews']},
+    {'id': 'starter', 'name': 'Starter', 'price': 19, 'features': ['Everything in Free', 'Up to 20 photos', 'Priority support', 'Lead tracking']},
+    {'id': 'pro', 'name': 'Pro', 'price': 49, 'features': ['Everything in Starter', 'Featured placement', 'Verified badge fast-track', 'Analytics dashboard']},
+    {'id': 'enterprise', 'name': 'Enterprise', 'price': 149, 'features': ['Everything in Pro', 'Multiple locations', 'Dedicated success manager', 'API access']},
+]
+
+@api.get("/subscriptions/plans")
+async def get_plans():
+    return PLANS
+
+@api.get("/subscriptions/me")
+async def my_subscription(user: dict = Depends(get_current_user)):
+    sub = await db.subscriptions.find_one({'user_id': user['id']}, {'_id': 0})
+    if not sub:
+        return {'plan_id': 'free', 'status': 'active'}
+    return sub
+
+@api.post("/subscriptions/subscribe")
+async def subscribe(data: SubscribeIn, user: dict = Depends(get_current_user)):
+    plan = next((p for p in PLANS if p['id'] == data.plan_id), None)
+    if not plan:
+        raise HTTPException(400, "Invalid plan")
+    sub = {
+        'id': new_id(), 'user_id': user['id'], 'plan_id': data.plan_id,
+        'plan_name': plan['name'], 'status': 'active',
+        'started_at': now_iso(), 'renews_at': (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+    }
+    await db.subscriptions.delete_many({'user_id': user['id']})
+    await db.subscriptions.insert_one(sub)
+    return {k: v for k, v in sub.items() if k != '_id'}
+
+# --- Claims ---
+@api.post("/businesses/{bid}/claim")
+async def claim_business(bid: str, data: ClaimIn, user: dict = Depends(get_current_user)):
+    biz = await db.businesses.find_one({'id': bid})
+    if not biz:
+        raise HTTPException(404, "Business not found")
+    existing = await db.claims.find_one({'business_id': bid, 'user_id': user['id'], 'status': 'pending'})
+    if existing:
+        raise HTTPException(400, "Claim already pending")
+    c = {
+        'id': new_id(), 'business_id': bid, 'business_name': biz['name'],
+        'user_id': user['id'], 'user_name': user['name'], 'user_email': user['email'],
+        'reason': data.reason, 'proof_url': data.proof_url,
+        'status': 'pending', 'created_at': now_iso(),
+    }
+    await db.claims.insert_one(c)
+    return {k: v for k, v in c.items() if k != '_id'}
+
+@api.get("/claims/me")
+async def my_claims(user: dict = Depends(get_current_user)):
+    items = await db.claims.find({'user_id': user['id']}, {'_id': 0}).sort('created_at', -1).to_list(200)
+    return items
+
+@api.get("/claims")
+async def all_claims(user: dict = Depends(require_role('admin'))):
+    items = await db.claims.find({}, {'_id': 0}).sort('created_at', -1).to_list(500)
+    return items
+
+@api.post("/claims/{cid}/approve")
+async def approve_claim(cid: str, user: dict = Depends(require_role('admin'))):
+    c = await db.claims.find_one({'id': cid})
+    if not c:
+        raise HTTPException(404, "Not found")
+    await db.claims.update_one({'id': cid}, {'$set': {'status': 'approved'}})
+    await db.businesses.update_one({'id': c['business_id']}, {'$set': {'owner_id': c['user_id'], 'verified': True}})
+    await db.users.update_one({'id': c['user_id']}, {'$set': {'role': 'business_owner'}})
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': c['user_id'],
+        'title': 'Claim Approved', 'body': f"Your claim for '{c['business_name']}' was approved. You are now the owner.",
+        'type': 'claim', 'read': False, 'created_at': now_iso(),
+    })
+    return {'ok': True}
+
+@api.post("/claims/{cid}/reject")
+async def reject_claim(cid: str, user: dict = Depends(require_role('admin'))):
+    c = await db.claims.find_one({'id': cid})
+    if not c:
+        raise HTTPException(404, "Not found")
+    await db.claims.update_one({'id': cid}, {'$set': {'status': 'rejected'}})
+    await db.notifications.insert_one({
+        'id': new_id(), 'user_id': c['user_id'],
+        'title': 'Claim Rejected', 'body': f"Your claim for '{c['business_name']}' was rejected.",
+        'type': 'claim', 'read': False, 'created_at': now_iso(),
+    })
+    return {'ok': True}
+
+# --- Admin ---
+@api.get("/admin/stats")
+async def admin_stats(user: dict = Depends(require_role('admin'))):
+    return {
+        'users': await db.users.count_documents({}),
+        'businesses': await db.businesses.count_documents({}),
+        'verified_businesses': await db.businesses.count_documents({'verified': True}),
+        'reviews': await db.reviews.count_documents({}),
+        'enquiries': await db.enquiries.count_documents({}),
+        'pending_claims': await db.claims.count_documents({'status': 'pending'}),
+    }
+
+@api.get("/admin/users")
+async def admin_users(user: dict = Depends(require_role('admin'))):
+    users = await db.users.find({}, {'_id': 0, 'password': 0}).sort('created_at', -1).to_list(1000)
+    return users
+
+@api.patch("/admin/users/{uid}/role")
+async def admin_set_role(uid: str, role: str = Query(...), user: dict = Depends(require_role('admin'))):
+    if role not in ('customer', 'business_owner', 'admin'):
+        raise HTTPException(400, "Invalid role")
+    await db.users.update_one({'id': uid}, {'$set': {'role': role}})
+    return {'ok': True}
+
+@api.delete("/admin/users/{uid}")
+async def admin_delete_user(uid: str, user: dict = Depends(require_role('admin'))):
+    if uid == user['id']:
+        raise HTTPException(400, "Cannot delete self")
+    await db.users.delete_one({'id': uid})
+    return {'ok': True}
+
+# --- Seed ---
+DEFAULT_CATEGORIES = [
+    {'name': 'Restaurants', 'icon': 'UtensilsCrossed', 'color': '#EF4444'},
+    {'name': 'Cafes & Bakeries', 'icon': 'Coffee', 'color': '#D97706'},
+    {'name': 'Beauty & Spa', 'icon': 'Sparkles', 'color': '#EC4899'},
+    {'name': 'Fitness & Wellness', 'icon': 'Dumbbell', 'color': '#10B981'},
+    {'name': 'Home Services', 'icon': 'Wrench', 'color': '#6366F1'},
+    {'name': 'Auto & Repair', 'icon': 'Car', 'color': '#0EA5E9'},
+    {'name': 'Health & Medical', 'icon': 'Stethoscope', 'color': '#14B8A6'},
+    {'name': 'Retail & Shopping', 'icon': 'ShoppingBag', 'color': '#8B5CF6'},
+    {'name': 'Education', 'icon': 'GraduationCap', 'color': '#F59E0B'},
+    {'name': 'Professional', 'icon': 'Briefcase', 'color': '#64748B'},
+]
+
+SAMPLE_IMAGES = [
+    "https://images.unsplash.com/photo-1571942948809-74637bfc59b9?crop=entropy&cs=srgb&fm=jpg&q=85&w=1200",
+    "https://images.unsplash.com/photo-1511018556340-d16986a1c194?crop=entropy&cs=srgb&fm=jpg&q=85&w=1200",
+    "https://images.pexels.com/photos/33870288/pexels-photo-33870288.jpeg?auto=compress&cs=tinysrgb&w=1200",
+    "https://images.pexels.com/photos/5865683/pexels-photo-5865683.jpeg?auto=compress&cs=tinysrgb&w=1200",
+    "https://images.pexels.com/photos/19571937/pexels-photo-19571937.jpeg?auto=compress&cs=tinysrgb&w=1200",
+    "https://images.unsplash.com/photo-1584696049838-8e692282a2e6?crop=entropy&cs=srgb&fm=jpg&q=85&w=1200",
+]
+
+SAMPLE_BUSINESSES = [
+    ("Sundara Coffee Roasters", "Cafes & Bakeries", "Small-batch specialty coffee roasted in-house. Warm neighbourhood cafe with pour-overs, pastries and a quiet loft.", "Bengaluru", "12 Church Street", ["Espresso", "Pour Over", "Cold Brew", "Pastries"], 4.7, 12.9749, 77.6069),
+    ("Amma's South Kitchen", "Restaurants", "Authentic South Indian cuisine, hand-ground masalas and heirloom recipes served on banana leaves.", "Chennai", "88 Mylapore Road", ["Dine-in", "Takeaway", "Catering", "Thali"], 4.8, 13.0356, 80.2680),
+    ("Bloom Beauty Studio", "Beauty & Spa", "Full-service salon offering hair, skin, nails and bridal packages by senior stylists.", "Mumbai", "45 Bandra West", ["Haircut", "Facial", "Bridal", "Nails"], 4.6, 19.0596, 72.8295),
+    ("Iron Peak Gym", "Fitness & Wellness", "Modern strength & conditioning gym with certified coaches, group HIIT and personal training.", "Bengaluru", "22 Indiranagar", ["Personal Training", "HIIT", "CrossFit", "Nutrition"], 4.5, 12.9784, 77.6408),
+    ("HomeFix Pro", "Home Services", "Trusted electricians, plumbers and handymen. Same-day service, background verified professionals.", "Hyderabad", "Gachibowli Main Rd", ["Electrical", "Plumbing", "Painting", "AC Repair"], 4.4, 17.4400, 78.3489),
+    ("QuickShift Auto", "Auto & Repair", "Multi-brand car service centre with genuine parts, insurance claims and doorstep pickup.", "Pune", "FC Road 34", ["Servicing", "Denting", "Insurance", "Pickup"], 4.3, 18.5204, 73.8567),
+    ("Aarogya Clinic", "Health & Medical", "General physicians, paediatrics and lab tests under one roof. Walk-ins welcome.", "Chennai", "Anna Nagar East", ["Consultation", "Lab Tests", "Vaccination"], 4.6, 13.0850, 80.2101),
+    ("The Curated Closet", "Retail & Shopping", "Independent boutique for slow fashion, handloom sarees and local designer wear.", "Bengaluru", "MG Road", ["Sarees", "Kurtis", "Accessories"], 4.5, 12.9752, 77.6098),
+    ("Bright Minds Academy", "Education", "K-12 tutoring, olympiad prep and STEM workshops with small batch sizes.", "Mumbai", "Andheri West", ["Tutoring", "Olympiad", "STEM"], 4.7, 19.1197, 72.8464),
+    ("Ledger & Co.", "Professional", "Chartered accountants for SMEs. GST, tax filing, audits and financial advisory.", "Delhi", "Connaught Place", ["GST", "Tax Filing", "Audit"], 4.4, 28.6328, 77.2197),
+    ("Petal & Loom Bakery", "Cafes & Bakeries", "Artisan sourdough, cakes and celebration desserts baked fresh daily.", "Hyderabad", "Jubilee Hills", ["Sourdough", "Cakes", "Croissants"], 4.6, 17.4239, 78.4738),
+    ("Naga Biryani House", "Restaurants", "Legendary dum biryani with slow-cooked flavour. Family recipes since 1978.", "Hyderabad", "Charminar Lane", ["Biryani", "Kebabs", "Desserts"], 4.9, 17.3616, 78.4747),
+]
+
+@api.post("/seed")
+async def seed_data():
+    # Idempotent seed
+    if await db.categories.count_documents({}) > 0:
+        # if already seeded, just return counts
+        return {
+            'ok': True, 'already_seeded': True,
+            'users': await db.users.count_documents({}),
+            'businesses': await db.businesses.count_documents({}),
+            'categories': await db.categories.count_documents({}),
+        }
+    # categories
+    cats = []
+    for c in DEFAULT_CATEGORIES:
+        doc = {'id': new_id(), 'name': c['name'], 'slug': slugify(c['name']),
+               'icon': c['icon'], 'color': c['color'], 'created_at': now_iso()}
+        cats.append(doc)
+    await db.categories.insert_many(cats)
+    cat_by_name = {c['name']: c for c in cats}
+
+    # admin user
+    admin = {
+        'id': new_id(), 'name': 'Infoez Admin', 'email': 'admin@infoez.com',
+        'password': hash_password('Admin@123'), 'role': 'admin', 'phone': None, 'avatar': None,
+        'created_at': now_iso(),
+    }
+    owner = {
+        'id': new_id(), 'name': 'Ravi Kumar', 'email': 'owner@infoez.com',
+        'password': hash_password('Owner@123'), 'role': 'business_owner', 'phone': '+91 90000 00000', 'avatar': None,
+        'created_at': now_iso(),
+    }
+    customer = {
+        'id': new_id(), 'name': 'Priya Sharma', 'email': 'customer@infoez.com',
+        'password': hash_password('Customer@123'), 'role': 'customer', 'phone': '+91 91111 11111', 'avatar': None,
+        'created_at': now_iso(),
+    }
+    await db.users.insert_many([admin, owner, customer])
+
+    # businesses + seed reviews to make ratings coherent
+    biz_docs = []
+    review_docs = []
+    for i, (name, cat_name, desc, city, addr, services, rating, lat, lng) in enumerate(SAMPLE_BUSINESSES):
+        cat = cat_by_name.get(cat_name)
+        bid = new_id()
+        review_rating = int(round(rating))
+        review_docs.append({
+            'id': new_id(), 'business_id': bid, 'user_id': customer['id'],
+            'rating': review_rating, 'comment': "Great experience — friendly staff, quality service, would recommend.",
+            'created_at': now_iso(),
+        })
+        biz_docs.append({
+            'id': bid,
+            'owner_id': owner['id'] if i % 2 == 0 else admin['id'],
+            'slug': slugify(name) + f"-{i+1}",
+            'name': name, 'description': desc,
+            'category_id': cat['id'] if cat else None,
+            'address': addr, 'city': city,
+            'lat': lat, 'lng': lng,
+            'phone': f"+91 9{80000000 + i * 1234}", 'email': f"hello@{slugify(name)}.in",
+            'website': f"https://{slugify(name)}.in",
+            'services': services,
+            'images': [SAMPLE_IMAGES[i % len(SAMPLE_IMAGES)], SAMPLE_IMAGES[(i+1) % len(SAMPLE_IMAGES)]],
+            'price_range': ['$', '$$', '$$$'][i % 3],
+            'hours': 'Mon-Sun 9:00 AM - 10:00 PM',
+            'rating': float(review_rating), 'review_count': 1, 'view_count': 100 + i * 15,
+            'verified': i % 3 != 0, 'featured': i < 4, 'status': 'active',
+            'created_at': now_iso(),
+        })
+    await db.businesses.insert_many(biz_docs)
+    await db.reviews.insert_many(review_docs)
+
+    return {
+        'ok': True, 'seeded': True,
+        'admin_email': 'admin@infoez.com', 'admin_password': 'Admin@123',
+        'owner_email': 'owner@infoez.com', 'owner_password': 'Owner@123',
+        'customer_email': 'customer@infoez.com', 'customer_password': 'Customer@123',
+    }
+
+# --- Uploads ---
+MIME_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+              "gif": "image/gif", "webp": "image/webp"}
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8MB per file
+
+@api.post("/uploads")
+async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else "bin"
+    if ext not in MIME_TYPES:
+        raise HTTPException(400, "Only jpg, jpeg, png, gif, webp allowed")
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File too large (max 8MB)")
+    content_type = MIME_TYPES[ext]
+    path = f"{APP_NAME}/uploads/{user['id']}/{uuid.uuid4()}.{ext}"
+    try:
+        result = put_object(path, data, content_type)
+    except Exception as e:
+        _logger.exception("upload failed")
+        raise HTTPException(500, f"Storage error: {e}")
+    await db.files.insert_one({
+        'id': new_id(), 'user_id': user['id'],
+        'storage_path': result['path'],
+        'original_filename': file.filename,
+        'content_type': content_type, 'size': result.get('size', len(data)),
+        'is_deleted': False, 'created_at': now_iso(),
+    })
+    # public url served by our GET /api/files/{path:path}
+    public_url = f"/api/files/{result['path']}"
+    return {'path': result['path'], 'url': public_url, 'size': result.get('size', len(data))}
+
+@api.get("/files/{path:path}")
+async def download_file(path: str):
+    # Business photos are publicly viewable (like Justdial / Yelp).
+    rec = await db.files.find_one({'storage_path': path, 'is_deleted': False})
+    if not rec:
+        raise HTTPException(404, "File not found")
+    try:
+        data, ctype = get_object(path)
+    except Exception:
+        raise HTTPException(404, "File not found")
+    return Response(content=data, media_type=rec.get('content_type', ctype),
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+# --- Wire up ---
+app.include_router(api)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
