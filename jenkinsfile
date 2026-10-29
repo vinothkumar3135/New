@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        BRANCH      = 'New'
+        BRANCH      = 'Vinodh-kumar'
         SSH_CRED_ID = 'pem-key'                       // Jenkins credential holding your .pem key
         EC2_HOST    = 'ubuntu@43.204.150.240'        // e.g. ubuntu@13.233.10.20
         REPO_URL    = 'https://github.com/vinothkumar3135/New.git'
