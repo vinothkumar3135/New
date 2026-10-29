@@ -3,8 +3,8 @@ pipeline {
 
     environment {
         BRANCH      = 'New'
-        SSH_CRED_ID = 'my-ec2-key'                       // Jenkins credential holding your .pem key
-        EC2_HOST    = 'ubuntu@YOUR_EC2_PUBLIC_IP'        // e.g. ubuntu@13.233.10.20
+        SSH_CRED_ID = 'pem-key'                       // Jenkins credential holding your .pem key
+        EC2_HOST    = 'ubuntu@43.204.150.240'        // e.g. ubuntu@13.233.10.20
         REPO_URL    = 'https://github.com/vinothkumar3135/New.git'
         APP_DIR     = '/home/ubuntu/Backend-new'
         ENV_SRC     = '/home/ubuntu/env-new.env'
